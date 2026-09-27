@@ -261,7 +261,7 @@ export const LiveVoiceAssistant: React.FC<LiveVoiceAssistantProps> = ({
                 <button
                   onClick={() => onReplayAudio(adjudication.spokenExplanation)}
                   className="shrink-0 p-2 rounded-xl bg-white/10 hover:bg-white/20 text-white transition cursor-pointer flex items-center gap-1.5 text-xs"
-                  title="Listen to Spoken Explanation via Gemini TTS"
+                  title="Listen to Spoken Explanation"
                 >
                   <Volume2 className={`w-4 h-4 ${isPlayingAudio ? 'text-[#0066FF] animate-pulse' : 'text-slate-300'}`} />
                   <span className="hidden sm:inline">Listen</span>

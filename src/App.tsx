@@ -2,9 +2,16 @@
  * Live Policy & Claims Voice Assistant — BFSI / Insurance
  * NSOffice.AI AI Centre of Excellence
  * Built with Gemini Live API (Audio-to-Audio WebSocket) and gemini-3-flash-preview
+ *
+ * The browser connects DIRECTLY to Gemini's Live WebSocket using a short-lived
+ * ephemeral token minted by /api/live-token. This is required because the app
+ * deploys to Vercel, whose serverless functions cannot host a persistent
+ * WebSocket relay — only the browser <-> Google connection can stay open.
+ * GEMINI_API_KEY itself never leaves the server.
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { GoogleGenAI, Modality } from '@google/genai';
 import { Header } from './components/Header';
 import { DocumentViewer } from './components/DocumentViewer';
 import { LiveVoiceAssistant, AdjudicationResult } from './components/LiveVoiceAssistant';
@@ -13,6 +20,37 @@ import { InfoModal } from './components/InfoModal';
 import { POLICIES, InsurancePolicy } from './data/policies';
 import { LiveAudioPlayer, LiveAudioRecorder } from './utils/audio';
 import { ScreenStreamer } from './utils/screenStreamer';
+
+const LIVE_MODEL = 'gemini-3.1-flash-live-preview';
+
+function buildLiveSystemInstruction(policyTitle: string, policyText: string): string {
+  return `You are a real-time BFSI Insurance Policy and Claims Voice Assistant for NSOffice AI Centre of Excellence.
+You are on a live voice call with a policyholder who has a question or wants to report a claim.
+You can hear the caller in real time, and you can also SEE the policy document or screen shared with you.
+
+POLICY CONTEXT:
+${policyTitle ? `Current Policy: ${policyTitle}` : ''}
+${policyText ? `Policy Document Text:\n${policyText.slice(0, 12000)}` : ''}
+
+VOICE BEHAVIOR RULES:
+1. Speak concisely in plain, natural, reassuring spoken English.
+2. DO NOT output long lists, markdown bullet points, or walls of text. Keep your responses under 3 sentences unless asked for more.
+3. GROUND your answer in the actual policy document: Always explicitly mention the clause number (e.g. "Under Clause 1.2(c)...") and the applicable deductible.
+4. If the caller shares a visual of their document or damage, acknowledge what you see directly.
+5. Provide immediate clarity on coverage status (covered, not covered, or requires documentation) and state the exact next steps.
+6. If the caller interrupts you, stop immediately and listen.`;
+}
+
+// Fetches a short-lived, single-use Gemini Live token from our backend.
+// The raw GEMINI_API_KEY is never sent to or stored in the browser.
+async function fetchLiveToken(): Promise<string> {
+  const res = await fetch('/api/live-token', { method: 'POST' });
+  if (!res.ok) {
+    throw new Error('Failed to obtain live session token');
+  }
+  const data = await res.json();
+  return data.token;
+}
 
 export default function App() {
   // Policies state
@@ -48,7 +86,7 @@ export default function App() {
   const audioPlayerRef = useRef<LiveAudioPlayer | null>(null);
   const audioRecorderRef = useRef<LiveAudioRecorder | null>(null);
   const screenStreamerRef = useRef<ScreenStreamer | null>(null);
-  const webSocketRef = useRef<WebSocket | null>(null);
+  const liveSessionRef = useRef<any | null>(null);
   const screenVideoRef = useRef<HTMLVideoElement | null>(null);
   const animFrameRef = useRef<number | null>(null);
   const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -99,13 +137,13 @@ export default function App() {
 
   // Stop all streams and active calls
   const stopAllStreams = () => {
-    if (webSocketRef.current) {
+    if (liveSessionRef.current) {
       try {
-        webSocketRef.current.close();
+        liveSessionRef.current.close();
       } catch (e) {
         // ignore
       }
-      webSocketRef.current = null;
+      liveSessionRef.current = null;
     }
     if (audioRecorderRef.current) {
       audioRecorderRef.current.stop();
@@ -121,68 +159,64 @@ export default function App() {
     setIsDocumentStreaming(false);
   };
 
-  // Start Live Voice Call (WebSocket to /live)
+  // Start Live Voice Call — browser connects directly to Gemini's Live API
+  // using a short-lived ephemeral token (see fetchLiveToken above).
   const handleStartCall = async () => {
     try {
       setIsCallActive(true);
       audioPlayerRef.current?.init();
 
-      // Establish WebSocket
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/live`;
-      const ws = new WebSocket(wsUrl);
-      webSocketRef.current = ws;
+      const token = await fetchLiveToken();
+      // Ephemeral Live tokens are only supported on the v1alpha API surface.
+      const liveClient = new GoogleGenAI({ apiKey: token, httpOptions: { apiVersion: 'v1alpha' } });
 
-      ws.onopen = () => {
-        console.log('WebSocket connected to /live');
-        // Initialize Gemini Live session with current policy text
-        ws.send(
-          JSON.stringify({
-            type: 'init',
-            policyTitle: currentPolicy.title,
-            policyText: currentPolicy.fullDocumentText,
-            voice: selectedVoice,
-          })
-        );
-      };
+      const session = await liveClient.live.connect({
+        model: LIVE_MODEL,
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: selectedVoice || 'Zephyr' } },
+          },
+          systemInstruction: {
+            parts: [{ text: buildLiveSystemInstruction(currentPolicy.title, currentPolicy.fullDocumentText) }],
+          },
+        },
+        callbacks: {
+          onmessage: (serverMsg: any) => {
+            const part = serverMsg.serverContent?.modelTurn?.parts?.[0];
+            const audio = part?.inlineData?.data;
+            const text = part?.text;
 
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
+            if (audio) {
+              audioPlayerRef.current?.playChunk(audio);
+            }
 
-          if (msg.type === 'ready') {
-            console.log('Gemini Live session ready:', msg.model);
-          }
+            if (text) {
+              setLatestSpokenResponse((prev) => (prev ? prev + ' ' + text : text));
+            }
 
-          if (msg.type === 'audio' && msg.audio) {
-            audioPlayerRef.current?.playChunk(msg.audio);
-          }
+            if (serverMsg.serverContent?.interrupted) {
+              console.log('Caller barged in: flushing audio queue');
+              audioPlayerRef.current?.stopAndFlush();
+            }
+          },
+          onerror: (err: any) => {
+            console.error('Live session error:', err);
+          },
+          onclose: () => {
+            console.log('Gemini Live session closed');
+          },
+        },
+      });
 
-          if (msg.type === 'interrupted') {
-            console.log('Caller barged in: flushing audio queue');
-            audioPlayerRef.current?.stopAndFlush();
-          }
-
-          if (msg.type === 'text' && msg.text) {
-            setLatestSpokenResponse((prev) => (prev ? prev + ' ' + msg.text : msg.text));
-          }
-        } catch (e) {
-          console.error('Error handling WebSocket message:', e);
-        }
-      };
-
-      ws.onerror = (err) => {
-        console.warn('WebSocket connection notice:', err);
-      };
-
-      ws.onclose = () => {
-        console.log('WebSocket connection closed');
-      };
+      liveSessionRef.current = session;
 
       // Start Microphone Capture (16kHz PCM linear16)
       await audioRecorderRef.current?.start((base64Chunk) => {
-        if (!isMicMuted && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'audio', audio: base64Chunk }));
+        if (!isMicMuted && liveSessionRef.current) {
+          liveSessionRef.current.sendRealtimeInput({
+            audio: { data: base64Chunk, mimeType: 'audio/pcm;rate=16000' },
+          });
         }
       });
     } catch (err) {
@@ -206,8 +240,10 @@ export default function App() {
       setIsScreenSharing(false);
     } else {
       const ok = await screenStreamerRef.current?.startScreenShare((base64Jpeg) => {
-        if (webSocketRef.current?.readyState === WebSocket.OPEN) {
-          webSocketRef.current.send(JSON.stringify({ type: 'video', video: base64Jpeg }));
+        if (liveSessionRef.current) {
+          liveSessionRef.current.sendRealtimeInput({
+            video: { data: base64Jpeg, mimeType: 'image/jpeg' },
+          });
         }
       });
 
@@ -278,8 +314,10 @@ export default function App() {
         screenStreamerRef.current?.startCanvasStream(
           offscreenCanvasRef.current,
           (base64Jpeg) => {
-            if (webSocketRef.current?.readyState === WebSocket.OPEN) {
-              webSocketRef.current.send(JSON.stringify({ type: 'video', video: base64Jpeg }));
+            if (liveSessionRef.current) {
+              liveSessionRef.current.sendRealtimeInput({
+                video: { data: base64Jpeg, mimeType: 'image/jpeg' },
+              });
             }
           }
         );
@@ -299,9 +337,9 @@ export default function App() {
   const handleQueryAdjudication = async (userQuery: string) => {
     setIsProcessing(true);
     try {
-      // Also send text over WebSocket if call is active
-      if (webSocketRef.current?.readyState === WebSocket.OPEN) {
-        webSocketRef.current.send(JSON.stringify({ type: 'text', text: userQuery }));
+      // Also send text into the live session if a call is active
+      if (liveSessionRef.current) {
+        liveSessionRef.current.sendRealtimeInput({ text: userQuery });
       }
 
       const res = await fetch('/api/policy/analyze', {
@@ -335,7 +373,7 @@ export default function App() {
         setActiveClauseId(currentPolicy.clauses[0]?.id || null);
       }
 
-      // Automatically synthesize speech via Gemini TTS
+      // Automatically speak the result aloud
       handleReplayAudio(data.spokenExplanation);
     } catch (err) {
       console.error('Adjudication error:', err);
@@ -344,31 +382,26 @@ export default function App() {
     }
   };
 
-  // Synthesize Speech via Gemini TTS (gemini-3-flash-preview)
-  const handleReplayAudio = async (textToSpeak: string) => {
-    if (!textToSpeak || isPlayingAudio) return;
+  // Replay a typed-query adjudication result as speech using the browser's
+  // native speech synthesis. Gemini's two brief-approved models are
+  // gemini-3.1-flash-live-preview (audio-to-audio, used for the live call
+  // above) and gemini-3-flash-preview (text-only — it does not support an
+  // audio response modality), so there is no compliant Gemini model for a
+  // standalone "speak this text" convenience outside a live session.
+  const handleReplayAudio = (textToSpeak: string) => {
+    if (!textToSpeak || isPlayingAudio || typeof window === 'undefined' || !window.speechSynthesis) return;
     setIsPlayingAudio(true);
     try {
-      const res = await fetch('/api/gemini/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: textToSpeak,
-          voice: selectedVoice,
-        }),
-      });
-
-      if (!res.ok) throw new Error('TTS failed');
-      const data = await res.json();
-
-      if (data.audio) {
-        audioPlayerRef.current?.stopAndFlush();
-        audioPlayerRef.current?.playChunk(data.audio);
-      }
+      audioPlayerRef.current?.stopAndFlush();
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(textToSpeak);
+      utterance.rate = 1.0;
+      utterance.onend = () => setIsPlayingAudio(false);
+      utterance.onerror = () => setIsPlayingAudio(false);
+      window.speechSynthesis.speak(utterance);
     } catch (err) {
-      console.warn('TTS playback notice:', err);
-    } finally {
-      setTimeout(() => setIsPlayingAudio(false), 2000);
+      console.warn('Speech playback notice:', err);
+      setIsPlayingAudio(false);
     }
   };
 

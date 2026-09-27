@@ -58,6 +58,8 @@ The assistant comes pre-loaded with comprehensive, authentic insurance policy co
 
 ## 🏗️ Technical Architecture
 
+The app is built to run on **Vercel's serverless platform**, which cannot host a persistent WebSocket relay. So instead of proxying live audio through our own backend, the **browser connects directly to Google's Gemini Live WebSocket**, authenticated with a short-lived, single-use token minted by a serverless function. `GEMINI_API_KEY` itself never reaches the browser.
+
 ```
                     ┌───────────────────────────────────────────────┐
                     │            Browser Client (React SPA)          │
@@ -66,38 +68,34 @@ The assistant comes pre-loaded with comprehensive, authentic insurance policy co
                     │   - Screen & Document Canvas Streamer (1 FPS) │
                     │   - Interactive Clause Highlighter            │
                     │   - FNOL Claim Report Generator & Exporter    │
-                    └───────┬───────────────────────────────▲───────┘
-                            │                               │
-             16kHz PCM Mic  │                               │ 24kHz PCM Audio
-             1 FPS Video    │                               │ Turn Text / Events
-                            ▼                               │
-                    ┌───────────────────────────────────────┴───────┐
-                    │        Full-Stack Express & WebSocket Server   │
-                    │                   (server.ts)                 │
-                    │   - WebSocket endpoint on /live               │
-                    │   - POST /api/policy/analyze (Clause citation)│
-                    │   - POST /api/gemini/tts (Flash Lite TTS)     │
-                    │   - Vite Dev Middleware / Static Host         │
-                    └───────┬───────────────────────────────▲───────┘
-                            │                               │
-               Bi-directional Live Connect (WebSocket)      │
-                            ▼                               │
-                    ┌───────────────────────────────────────┴───────┐
-                    │               Google Gemini API               │
-                    │   - gemini-3.1-flash-live-preview (Live Audio)│
-                    │   - gemini-3-flash-preview (Adjudication, FNOL & TTS)│
-                    └───────────────────────────────────────────────┘
+                    └──────┬───────────────────────────┬───▲────────┘
+                            │                           │   │
+        POST /api/live-token│           Direct Live Connect (WebSocket)
+        POST /api/policy/*  │                           │   │
+                            ▼                           ▼   │
+                    ┌───────────────────┐       ┌───────────┴─────────┐
+                    │ Vercel Serverless  │       │   Google Gemini API │
+                    │ Functions (api/*)  │       │ gemini-3.1-flash-   │
+                    │ - live-token.ts    │       │  live-preview (Live)│
+                    │ - policy/analyze.ts│──────▶│ gemini-3-flash-     │
+                    └───────────────────┘        │  preview (Text)     │
+                                                  └──────────────────────┘
 ```
 
-### 1. Gemini Live API Integration (`/live`)
-- **WebSocket Protocol**: Client streams microphone audio chunks encoded as raw 16-bit linear PCM (`audio/pcm;rate=16000`).
-- **Screen Awareness**: Streams 1 FPS JPEG frames (`image/jpeg`) capturing the active policy document or the user's shared desktop window.
+### 1. Gemini Live API Integration (direct browser connection)
+- The browser calls `POST /api/live-token` (a Vercel serverless function) which mints a short-lived, single-use ephemeral token via `ai.authTokens.create(...)`, so the real API key never leaves the server.
+- The browser then opens `ai.live.connect(...)` directly to Google using that token, streaming microphone audio (`audio/pcm;rate=16000`) and 1 FPS JPEG frames (`image/jpeg`) of the shared screen or document canvas.
 - **Low-Latency Spoken Response**: Gemini Live outputs raw 24kHz audio (`audio/pcm;rate=24000`), scheduled seamlessly via Web Audio API.
-- **Mid-Response Barge-in**: When the caller interrupts, the server sends `{ type: 'interrupted' }`, immediately stopping playback and clearing audio queues.
+- **Mid-Response Barge-in**: When the caller interrupts, `serverContent.interrupted` is delivered straight to the browser's `onmessage` callback, which immediately flushes the audio queue.
+- `server.ts` (used only for local development via `npm run dev`) exposes the same `/api/live-token` route through Express so local behavior matches production exactly.
 
 ### 2. Deep Clause Adjudication & FNOL (`/api/policy/analyze`)
 - Analyzes caller statements against the policy contract using **gemini-3-flash-preview**.
 - Extracts: Coverage verdict (`COVERED`, `PARTIALLY_COVERED`, `EXCLUDED`), cited clause, exact clause quote, applicable deductible, 2-to-3 sentence spoken explanation, action steps, and First Notice of Loss (FNOL) draft.
+- Implemented once in `api/_shared/gemini.ts` and reused by both the Vercel function (`api/policy/analyze.ts`) and the local Express server (`server.ts`), so the two never drift apart.
+
+### 3. "Listen" Replay for Typed Queries
+- When a caller types a question instead of speaking (or wants to re-hear an answer), the spoken explanation is replayed via the browser's native `SpeechSynthesis` API, not a Gemini call. Gemini's two brief-approved models are `gemini-3.1-flash-live-preview` (audio-to-audio, used only inside an active live call) and `gemini-3-flash-preview` (text-only, no audio output) — there is no compliant Gemini model for standalone text-to-speech outside a live session.
 
 ---
 
@@ -138,7 +136,7 @@ APP_URL="http://localhost:3000"
 ```bash
 npm run dev
 ```
-The server will start on `http://localhost:3000` with the Express backend, WebSocket server on `/live`, and Vite frontend mounted simultaneously.
+The server will start on `http://localhost:3000` with the Express backend (serving `/api/live-token` and `/api/policy/analyze`) and the Vite frontend mounted simultaneously. The browser connects directly to Gemini's Live API using a token from `/api/live-token`, the same way it does in production on Vercel.
 
 ### Step 5: Build for Production
 ```bash
@@ -148,31 +146,33 @@ npm start
 
 ---
 
-## 🌐 Deployment to Vercel / Cloud Platforms
+## 🌐 Deployment to Vercel
 
-### Deploying on Vercel
 1. Push your repository to GitHub.
 2. Log in to [Vercel](https://vercel.com/) and click **"Add New Project"**.
-3. Import your GitHub repository.
+3. Import your GitHub repository. Vercel auto-detects the Vite framework preset (build command `vite build`, output directory `dist`) and picks up the `api/` folder as serverless functions automatically.
 4. Add the Environment Variable in Vercel settings:
    - Key: `GEMINI_API_KEY`
    - Value: `your-gemini-api-key`
-5. Click **Deploy**. Vercel will build the frontend via `npm run build`.
+5. Click **Deploy**.
+6. If the deployment URL redirects to a Vercel login page, go to **Project Settings → Deployment Protection** and disable it (or use the Production domain instead of a preview-deployment link) so the public link is reachable without a Vercel account.
 
-*(For full WebSocket Live audio streaming in production environments, deploy to Google Cloud Run, Railway, or Render where stateful WebSocket connections are fully sustained).*
+Because the browser connects directly to Gemini's Live API using a short-lived token (see Technical Architecture above), the full real-time voice and screen-aware experience — not just the static UI — works on Vercel's serverless functions with no separate always-on server required.
 
 ---
 
 ## 📋 Submission Checklist (Network Science Brief)
 
 - [x] **Project Selected**: Project Idea 2 (Live Policy and Claims Voice Assistant BFSI / Insurance)
-- [x] **Real-Time Gemini Live API**: Live audio conversation (`gemini-3.1-flash-live-preview`) with 16kHz PCM streaming and 24kHz playback
+- [x] **Real-Time Gemini Live API**: Live audio conversation (`gemini-3.1-flash-live-preview`) with 16kHz PCM streaming and 24kHz playback, connected directly from the browser so it works on Vercel's serverless functions
 - [x] **Live Screen & Document Awareness**: 1 FPS frame streaming allowing Gemini to visually inspect policy clauses on screen
 - [x] **Mid-Response Interruption (Barge-In)**: Immediate audio flush when caller speaks
-- [x] **Clause Grounding**: Direct citation of clauses and deductibles with no walls of text
+- [x] **Clause Grounding**: Direct citation of clauses and deductibles with no walls of text (`gemini-3-flash-preview`)
 - [x] **NSOffice Glass UI System**: Electric Blue (`#0066FF`), DM Sans font, Apple-style spacing, one primary action per view
 - [x] **First Notice of Loss (FNOL)**: Formal claims intake document export and printable report
-- [x] **API Key Security**: Stored in environment variable (`GEMINI_API_KEY`), `.env` added to `.gitignore`
+- [x] **API Key Security**: `GEMINI_API_KEY` only ever read server-side (`api/_shared/gemini.ts`); the browser only ever receives a short-lived, single-use ephemeral Live token, never the real key. `.env` is in `.gitignore`.
+- [x] **Public GitHub Repository**: pushed
+- [x] **Vercel Deployment**: live, public link (Deployment Protection disabled)
 
 ---
 
