@@ -1,0 +1,7 @@
+{
+  "name": "Live Policy & Claims Voice Assistant",
+  "description": "Real-time voice and screen-aware insurance policy and claims assistant powered by Gemini Live API with clause-grounded explanations.",
+  "requestFramePermissions": ["camera", "microphone", "display-capture"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
